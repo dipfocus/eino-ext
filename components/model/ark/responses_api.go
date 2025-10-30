@@ -39,18 +39,20 @@ import (
 type responsesAPIChatModel struct {
 	client responses.ResponseService
 
-	tools    []responses.ToolUnionParam
-	rawTools []*schema.ToolInfo
+	tools      []responses.ToolUnionParam
+	rawTools   []*schema.ToolInfo
+	toolChoice *schema.ToolChoice
 
-	model          string
-	maxTokens      *int
-	temperature    *float32
-	topP           *float32
-	customHeader   map[string]string
-	responseFormat *ResponseFormat
-	thinking       *arkModel.Thinking
-	cache          *CacheConfig
-	serviceTier    *string
+	model           string
+	maxTokens       *int
+	temperature     *float32
+	topP            *float32
+	customHeader    map[string]string
+	responseFormat  *ResponseFormat
+	thinking        *arkModel.Thinking
+	cache           *CacheConfig
+	serviceTier     *string
+	reasoningEffort *arkModel.ReasoningEffort
 }
 
 func (cm *responsesAPIChatModel) Generate(ctx context.Context, input []*schema.Message,
@@ -74,10 +76,11 @@ func (cm *responsesAPIChatModel) Generate(ctx context.Context, input []*schema.M
 	}
 
 	ctx = callbacks.OnStart(ctx, &model.CallbackInput{
-		Messages: input,
-		Tools:    tools,
-		Config:   config,
-		Extra:    map[string]any{callbackExtraKeyThinking: specOptions.thinking},
+		Messages:   input,
+		Tools:      tools,
+		ToolChoice: options.ToolChoice,
+		Config:     config,
+		Extra:      map[string]any{callbackExtraKeyThinking: specOptions.thinking},
 	})
 
 	defer func() {
@@ -127,10 +130,11 @@ func (cm *responsesAPIChatModel) Stream(ctx context.Context, input []*schema.Mes
 	}
 
 	ctx = callbacks.OnStart(ctx, &model.CallbackInput{
-		Messages: input,
-		Tools:    tools,
-		Config:   config,
-		Extra:    map[string]any{callbackExtraKeyThinking: specOptions.thinking},
+		Messages:   input,
+		Tools:      tools,
+		ToolChoice: options.ToolChoice,
+		Config:     config,
+		Extra:      map[string]any{callbackExtraKeyThinking: specOptions.thinking},
 	})
 
 	defer func() {
@@ -449,23 +453,39 @@ type responsesAPIRequestParams struct {
 func (cm *responsesAPIChatModel) genRequestAndOptions(in []*schema.Message, options *model.Options,
 	specOptions *arkOptions) (reqParams *responsesAPIRequestParams, err error) {
 
-	var text *responses.ResponseTextConfigParam
+	text := responses.ResponseTextConfigParam{}
 	if cm.responseFormat != nil {
-		text = &responses.ResponseTextConfigParam{
-			Format: responses.ResponseFormatTextConfigUnionParam{
-				OfText: ptrOf(shared.NewResponseFormatTextParam()),
-			},
-		}
-		if cm.responseFormat.Type == arkModel.ResponseFormatJsonObject {
-			text.Format = responses.ResponseFormatTextConfigUnionParam{
-				OfJSONObject: ptrOf(shared.NewResponseFormatJSONObjectParam()),
+		switch cm.responseFormat.Type {
+		case arkModel.ResponseFormatText:
+			text.Format.OfText = ptrOf(shared.NewResponseFormatTextParam())
+		case arkModel.ResponseFormatJsonObject:
+			text.Format.OfJSONObject = ptrOf(shared.NewResponseFormatJSONObjectParam())
+		case arkModel.ResponseFormatJSONSchema:
+			b, err := sonic.Marshal(cm.responseFormat.JSONSchema)
+			if err != nil {
+				return nil, fmt.Errorf("marshal JSONSchema fail: %w", err)
 			}
+
+			var paramsJSONSchema map[string]any
+			if err = sonic.Unmarshal(b, &paramsJSONSchema); err != nil {
+				return nil, fmt.Errorf("unmarshal JSONSchema fail: %w", err)
+			}
+
+			text.Format.OfJSONSchema = &responses.ResponseFormatTextJSONSchemaConfigParam{
+				Name:        cm.responseFormat.JSONSchema.Name,
+				Description: param.NewOpt(cm.responseFormat.JSONSchema.Description),
+				Schema:      paramsJSONSchema,
+				Strict:      param.NewOpt(cm.responseFormat.JSONSchema.Strict),
+			}
+
+		default:
+			return nil, fmt.Errorf("unsupported response format type: %s", cm.responseFormat.Type)
 		}
 	}
 
 	reqParams = &responsesAPIRequestParams{
 		req: &responses.ResponseNewParams{
-			Text:            ptrFromOrZero(text),
+			Text:            text,
 			Model:           ptrFromOrZero(options.Model),
 			MaxOutputTokens: newOpenaiIntOpt(options.MaxTokens),
 			Temperature:     newOpenaiFloatOpt(options.Temperature),
@@ -487,12 +507,32 @@ func (cm *responsesAPIChatModel) genRequestAndOptions(in []*schema.Message, opti
 		return nil, err
 	}
 
+	if options.ToolChoice != nil {
+		var tco responses.ToolChoiceOptions
+		switch *options.ToolChoice {
+		case schema.ToolChoiceForbidden:
+			tco = responses.ToolChoiceOptionsNone
+		case schema.ToolChoiceAllowed:
+			tco = responses.ToolChoiceOptionsAuto
+		case schema.ToolChoiceForced:
+			tco = responses.ToolChoiceOptionsRequired
+		default:
+			tco = responses.ToolChoiceOptionsAuto
+		}
+		reqParams.req.ToolChoice = responses.ResponseNewParamsToolChoiceUnion{
+			OfToolChoiceMode: param.NewOpt(tco),
+		}
+	}
+
 	for k, v := range specOptions.customHeaders {
 		reqParams.opts = append(reqParams.opts, option.WithHeaderAdd(k, v))
 	}
 
 	if specOptions.thinking != nil {
 		reqParams.opts = append(reqParams.opts, option.WithJSONSet("thinking", specOptions.thinking))
+	}
+	if specOptions.reasoningEffort != nil {
+		reqParams.opts = append(reqParams.opts, option.WithJSONSet("reasoning_effort", string(*specOptions.reasoningEffort)))
 	}
 
 	return reqParams, nil
@@ -955,12 +995,13 @@ func (cm *responsesAPIChatModel) getOptions(opts []model.Option) (*model.Options
 		MaxTokens:   cm.maxTokens,
 		Model:       &cm.model,
 		TopP:        cm.topP,
-		ToolChoice:  ptrOf(schema.ToolChoiceAllowed),
+		ToolChoice:  cm.toolChoice,
 	}, opts...)
 
 	arkOpts := model.GetImplSpecificOptions(&arkOptions{
-		customHeaders: cm.customHeader,
-		thinking:      cm.thinking,
+		customHeaders:   cm.customHeader,
+		thinking:        cm.thinking,
+		reasoningEffort: cm.reasoningEffort,
 	}, opts...)
 
 	if err := cm.checkOptions(options, arkOpts); err != nil {
